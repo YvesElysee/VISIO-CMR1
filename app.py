@@ -103,9 +103,9 @@ class VideoSourceManager:
             for k in stale_keys:
                 del active_mobile_streams[k]
                 
-            active_frames = [v["frame"] for v in active_mobile_streams.values() if v["frame"] is not None]
+            active_items = [v for v in active_mobile_streams.values() if v["frame"] is not None]
             
-            if len(active_frames) == 0:
+            if len(active_items) == 0:
                 err_frame = np.zeros((360, 640, 3), dtype=np.uint8)
                 cv2.rectangle(err_frame, (0, 0), (640, 360), (30, 45, 30), -1)
                 cv2.putText(err_frame, "En attente du flux mobile (Android / iOS)", (100, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
@@ -113,26 +113,41 @@ class VideoSourceManager:
                 cv2.putText(err_frame, "2. Cliquez sur 'Demarrer la Camera Mobile'", (60, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1)
                 return err_frame
                 
-            elif len(active_frames) == 1:
-                return active_frames[0]
+            elif len(active_items) == 1:
+                frame = active_items[0]["frame"].copy()
+                d_name = active_items[0].get("name", "Smartphone Mobile")
+                # Draw camera type HUD overlay
+                cv2.rectangle(frame, (10, 10), (380, 38), (15, 23, 42), -1)
+                cv2.putText(frame, f"CAM : {d_name}", (20, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (52, 211, 153), 2)
+                return frame
                 
             else:
                 # MULTI-CAMERA SPLIT SCREEN (Multiple phones streaming simultaneously)
-                if len(active_frames) == 2:
-                    f1 = cv2.resize(active_frames[0], (320, 360))
-                    f2 = cv2.resize(active_frames[1], (320, 360))
-                    cv2.putText(f1, "CAM 1 (MOBILE)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                    cv2.putText(f2, "CAM 2 (MOBILE)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                if len(active_items) == 2:
+                    f1 = cv2.resize(active_items[0]["frame"], (320, 360), interpolation=cv2.INTER_CUBIC)
+                    f2 = cv2.resize(active_items[1]["frame"], (320, 360), interpolation=cv2.INTER_CUBIC)
+                    
+                    cv2.rectangle(f1, (5, 5), (315, 30), (15, 23, 42), -1)
+                    cv2.putText(f1, f"CAM 1: {active_items[0].get('name', 'Tel 1')}", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (52, 211, 153), 1)
+                    
+                    cv2.rectangle(f2, (5, 5), (315, 30), (15, 23, 42), -1)
+                    cv2.putText(f2, f"CAM 2: {active_items[1].get('name', 'Tel 2')}", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (52, 211, 153), 1)
+                    
                     combined = np.hstack([f1, f2])
-                    cv2.line(combined, (320, 0), (320, 360), (0, 255, 255), 2)
+                    cv2.line(combined, (320, 0), (320, 360), (16, 185, 129), 2)
                     return combined
                 else:
-                    resized = [cv2.resize(f, (320, 180)) for f in active_frames[:4]]
+                    resized = []
+                    for idx, item in enumerate(active_items[:4]):
+                        img = cv2.resize(item["frame"], (320, 180), interpolation=cv2.INTER_CUBIC)
+                        cv2.rectangle(img, (5, 5), (315, 25), (15, 23, 42), -1)
+                        cv2.putText(img, f"CAM {idx+1}: {item.get('name', 'Mobile')}", (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (52, 211, 153), 1)
+                        resized.append(img)
+                        
                     while len(resized) < 4:
                         blank = np.zeros((180, 320, 3), dtype=np.uint8)
                         resized.append(blank)
-                    for idx, img in enumerate(resized):
-                        cv2.putText(img, f"CAM {idx+1}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                        
                     top_row = np.hstack([resized[0], resized[1]])
                     bot_row = np.hstack([resized[2], resized[3]])
                     return np.vstack([top_row, bot_row])
@@ -174,12 +189,28 @@ def get_status():
     else:
         metrics_state["network_loss"] = 3.84
         
+    src = settings["video_source"]
+    detected_source = "Simulation IA (Avatar 3D)"
+    if src == "webcam":
+        detected_source = "Webcam HD PC (Direct)"
+    elif src == "mobile":
+        count = len(active_mobile_streams)
+        if count == 0:
+            detected_source = "Caméra Mobile (En attente...)"
+        elif count == 1:
+            first_item = list(active_mobile_streams.values())[0]
+            detected_source = f"📱 {first_item.get('name', 'Smartphone Mobile')}"
+        else:
+            detected_source = f"📱 Multi-Caméras ({count} Smartphones en Écran Divisé)"
+            
     return {
         "settings": settings,
         "metrics": metrics_state,
         "server_ip": get_local_ip(),
         "has_models": enhancer.has_models,
-        "active_cameras": len(active_mobile_streams)
+        "active_cameras": len(active_mobile_streams),
+        "detected_source": detected_source,
+        "camera_list": [v.get("name", "Smartphone") for v in active_mobile_streams.values()]
     }
 
 @app.post("/api/settings")
@@ -203,12 +234,21 @@ def update_settings(new_settings: SettingsModel):
 async def websocket_mobile_camera(websocket: WebSocket):
     await websocket.accept()
     global active_mobile_streams, client_counter
-    client_counter += 1
-    client_id = f"client_{client_counter}"
-    active_mobile_streams[client_id] = {"frame": None, "last_update": time.time(), "id": client_counter}
+    
+    device_id = websocket.query_params.get("device_id")
+    device_name = websocket.query_params.get("device_name", "Smartphone Mobile")
+    if not device_id:
+        client_counter += 1
+        device_id = f"client_ws_{client_counter}"
+        
+    active_mobile_streams[device_id] = {
+        "frame": None,
+        "last_update": time.time(),
+        "name": device_name
+    }
     
     settings["video_source"] = "mobile"
-    print(f"📱 Smartphone #{client_counter} connecté via WebSocket ! Total caméras : {len(active_mobile_streams)}")
+    print(f"📱 {device_name} (ID: {device_id}) connecté via WebSocket ! Total caméras : {len(active_mobile_streams)}")
     
     try:
         while True:
@@ -217,18 +257,18 @@ async def websocket_mobile_camera(websocket: WebSocket):
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             
             if frame is not None:
-                resized_frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
-                active_mobile_streams[client_id]["frame"] = resized_frame
-                active_mobile_streams[client_id]["last_update"] = time.time()
+                resized_frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_CUBIC)
+                active_mobile_streams[device_id]["frame"] = resized_frame
+                active_mobile_streams[device_id]["last_update"] = time.time()
                 
             await websocket.send_text("ACK")
     except WebSocketDisconnect:
-        print(f"Smartphone #{client_id} déconnecté.")
+        print(f"Smartphone {device_name} déconnecté.")
     except Exception as e:
         print(f"Erreur WebSocket mobile : {e}")
     finally:
-        if client_id in active_mobile_streams:
-            del active_mobile_streams[client_id]
+        if device_id in active_mobile_streams:
+            del active_mobile_streams[device_id]
 
 # HTTP POST fallback endpoint for mobile camera ingestion
 @app.post("/api/upload_frame")
@@ -239,18 +279,21 @@ async def upload_frame(request: Request):
         if not data:
             return JSONResponse(content={"status": "empty"}, status_code=400)
             
+        device_id = request.headers.get("X-Device-Id")
+        device_name = request.headers.get("X-Device-Name", "Smartphone Mobile")
+        if not device_id:
+            client_ip = request.client.host if request.client else "http_client"
+            device_id = f"http_{client_ip}"
+            
         np_arr = np.frombuffer(data, dtype=np.uint8)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         
         if frame is not None:
-            client_ip = request.client.host if request.client else "http_client"
-            client_id = f"http_{client_ip}"
-            
-            resized_frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
-            active_mobile_streams[client_id] = {
+            resized_frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_CUBIC)
+            active_mobile_streams[device_id] = {
                 "frame": resized_frame,
                 "last_update": time.time(),
-                "id": client_ip
+                "name": device_name
             }
             settings["video_source"] = "mobile"
             

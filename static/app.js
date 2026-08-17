@@ -349,13 +349,8 @@ async function fetchStatus() {
         labelActiveMethod.textContent = data.metrics.used_method;
         hudMethodText.textContent = data.metrics.used_method;
         
-        // Update source label
-        const sourcesNames = {
-            simulation: "SIMULATION TV (CRTV)",
-            webcam: "WEBCAM LOCALE",
-            mobile: "CAMÉRA SMARTPHONE (WI-FI)"
-        };
-        labelActiveSource.textContent = sourcesNames[data.settings.video_source] || "INCONNU";
+        // Update source label with detected camera details
+        labelActiveSource.textContent = data.detected_source || "INCONNU";
         
         // Dynamic Recommendation Engine Text
         updateRecommendationEngine(data);
@@ -584,6 +579,26 @@ async function startMobileCameraStream() {
     }
 }
 
+// Device Identification and Camera Type Detection
+let deviceId = sessionStorage.getItem("visio_device_id");
+if (!deviceId) {
+    deviceId = "dev_" + Math.random().toString(36).substr(2, 9);
+    sessionStorage.setItem("visio_device_id", deviceId);
+}
+
+function getDeviceName() {
+    const ua = navigator.userAgent;
+    let dev = "Smartphone";
+    if (/iPhone|iPad|iPod/i.test(ua)) dev = "iPhone (iOS)";
+    else if (/Android/i.test(ua)) dev = "Android";
+    else if (/Windows/i.test(ua)) dev = "PC Windows";
+    else if (/Macintosh/i.test(ua)) dev = "Mac";
+    else if (/Linux/i.test(ua)) dev = "Linux";
+
+    const facing = currentFacingMode === "environment" ? "Arrière" : "Avant";
+    return `${dev} [Cam ${facing}]`;
+}
+
 let transmissionMode = "websocket"; // "websocket" or "http"
 let wsFailedCount = 0;
 
@@ -594,7 +609,8 @@ function connectWebSocket() {
     
     const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsHost = window.location.host;
-    const wsUrl = `${wsProtocol}//${wsHost}/api/ws/mobile`;
+    const devName = encodeURIComponent(getDeviceName());
+    const wsUrl = `${wsProtocol}//${wsHost}/api/ws/mobile?device_id=${deviceId}&device_name=${devName}`;
     
     if (mobileFpsBadge) {
         mobileFpsBadge.textContent = "🟡 Connexion WS...";
@@ -683,7 +699,11 @@ function startSendingFrames() {
                 else {
                     fetch(`${API_BASE}/api/upload_frame`, {
                         method: "POST",
-                        headers: { "Content-Type": "application/octet-stream" },
+                        headers: {
+                            "Content-Type": "application/octet-stream",
+                            "X-Device-Id": deviceId,
+                            "X-Device-Name": getDeviceName()
+                        },
                         body: blob
                     })
                     .then(res => {
@@ -704,12 +724,12 @@ function startSendingFrames() {
                         isSendingFrame = false;
                     });
                 }
-            }, "image/jpeg", 0.5); // 50% quality JPEG
+            }, "image/jpeg", 0.75); // 75% High Quality JPEG
         } catch (e) {
             isSendingFrame = false;
         }
         
-    }, 90); // ~11 FPS
+    }, 85); // ~12 FPS
     
     function updateFpsCounter() {
         const now = timeSeconds();
