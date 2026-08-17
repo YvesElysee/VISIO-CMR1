@@ -1,19 +1,7 @@
 // VISIO-CMR Dashboard Javascript Logic
 
-// Detect API backend base URL dynamically
-// If served from XAMPP (port 80/443), connect to FastAPI on port 8000
-// If served directly from FastAPI (port 8000), use relative paths
-const API_BASE = (function() {
-    const port = window.location.port;
-    const hostname = window.location.hostname;
-    // If we are NOT on port 8000, the frontend is served by XAMPP
-    // So we need to reach FastAPI on the same hostname but port 8000
-    if (port !== "8000") {
-        return `http://${hostname}:8000`;
-    }
-    // Already on FastAPI, use relative
-    return "";
-})();
+// Dynamic API Base URL (Relative path works everywhere: Render, Ngrok, Localhost, XAMPP)
+const API_BASE = "";
 
 // State management
 let currentSettings = {
@@ -285,13 +273,14 @@ async function fetchStatus() {
         
         serverIpText.textContent = serverIp;
         
-        // Update both mobile URL displays with HTTPS prefix
+        // Update mobile URL display dynamically using current site origin
+        const currentOrigin = window.location.origin;
         const mobileUrlFull = document.getElementById("mobile-url-span-full");
         if (mobileUrlFull) {
-            mobileUrlFull.textContent = `https://${serverIp}:8000`;
+            mobileUrlFull.textContent = currentOrigin;
         }
         if (mobileUrlSpan) {
-            mobileUrlSpan.textContent = `https://${serverIp}:8000`;
+            mobileUrlSpan.textContent = currentOrigin;
         }
         
         // Update models availability badge
@@ -556,9 +545,11 @@ async function startMobileCameraStream() {
         mobileCamPanel.classList.remove("hidden");
         mobileStartSection.classList.add("hidden");
         
-        // Connect WebSocket to FastAPI backend on port 8000
-        const wsHostname = window.location.hostname;
-        const wsUrl = `ws://${wsHostname}:8000/api/ws/mobile`;
+        // Connect WebSocket matching current page protocol (wss: for HTTPS, ws: for HTTP)
+        const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const wsHost = window.location.host;
+        const wsUrl = `${wsProtocol}//${wsHost}/api/ws/mobile`;
+        console.log(`Connexion WebSocket mobile vers : ${wsUrl}`);
         ws = new WebSocket(wsUrl);
         
         ws.onopen = () => {
