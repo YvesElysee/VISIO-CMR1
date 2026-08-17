@@ -584,8 +584,12 @@ async function startMobileCameraStream() {
     }
 }
 
+let transmissionMode = "websocket"; // "websocket" or "http"
+let wsFailedCount = 0;
+
 function connectWebSocket() {
     if (!isStreamingActive) return;
+    if (transmissionMode === "http") return; // Already operating in HTTP fallback
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
     
     const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -593,7 +597,7 @@ function connectWebSocket() {
     const wsUrl = `${wsProtocol}//${wsHost}/api/ws/mobile`;
     
     if (mobileFpsBadge) {
-        mobileFpsBadge.textContent = "🟡 Connexion...";
+        mobileFpsBadge.textContent = "🟡 Connexion WS...";
         mobileFpsBadge.className = "px-2.5 py-1 bg-yellow-950/80 border border-yellow-700 text-xs font-mono text-yellow-400 rounded-lg animate-pulse";
     }
     
@@ -602,28 +606,38 @@ function connectWebSocket() {
     
     ws.onopen = () => {
         console.log("WebSocket mobile connecté avec succès.");
+        transmissionMode = "websocket";
+        wsFailedCount = 0;
         isSendingFrame = false;
         if (mobileFpsBadge) {
-            mobileFpsBadge.textContent = "🟢 EN DIRECT";
+            mobileFpsBadge.textContent = "🟢 EN DIRECT (WS)";
             mobileFpsBadge.className = "px-2.5 py-1 bg-green-900/80 border border-green-500 text-xs font-mono text-green-300 font-bold rounded-lg";
         }
     };
     
     ws.onmessage = (event) => {
-        // Backend sent ACK: ready for next frame
+        // ACK from backend
         isSendingFrame = false;
     };
     
     ws.onclose = () => {
-        console.log("WebSocket mobile déconnecté. Tentative de reconnexion...");
+        wsFailedCount++;
+        console.log(`WebSocket déconnecté (tentative #${wsFailedCount}).`);
         isSendingFrame = false;
-        if (mobileFpsBadge && isStreamingActive) {
-            mobileFpsBadge.textContent = "🟡 Reconnexion...";
-            mobileFpsBadge.className = "px-2.5 py-1 bg-yellow-950/80 border border-yellow-700 text-xs font-mono text-yellow-400 rounded-lg animate-pulse";
+        
+        // If WebSocket is rejected or unsupported (404/Upgrade failed), switch to HTTP POST fallback!
+        if (wsFailedCount >= 2) {
+            console.warn("⚠️ WebSocket non supporté par le serveur. Basculement automatique sur le mode HTTP POST !");
+            transmissionMode = "http";
+            if (mobileFpsBadge) {
+                mobileFpsBadge.textContent = "🟢 EN DIRECT (HTTP)";
+                mobileFpsBadge.className = "px-2.5 py-1 bg-blue-900/80 border border-blue-500 text-xs font-mono text-blue-300 font-bold rounded-lg";
+            }
+            return;
         }
-        // Auto-reconnect WebSocket if streaming is still active
-        if (isStreamingActive) {
-            setTimeout(connectWebSocket, 1500);
+        
+        if (isStreamingActive && transmissionMode === "websocket") {
+            setTimeout(connectWebSocket, 1000);
         }
     };
     
@@ -646,8 +660,7 @@ function startSendingFrames() {
     
     streamInterval = setInterval(() => {
         if (!isStreamingActive) return;
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        if (isSendingFrame) return; // Flow control: wait for previous frame ACK
+        if (isSendingFrame) return; // Wait for previous frame delivery
         if (!mobileVideo || mobileVideo.readyState < 2) return;
         
         try {
@@ -655,33 +668,68 @@ function startSendingFrames() {
             isSendingFrame = true;
             
             hiddenCanvas.toBlob((blob) => {
-                if (blob && ws && ws.readyState === WebSocket.OPEN) {
+                if (!blob) {
+                    isSendingFrame = false;
+                    return;
+                }
+                
+                // Mode 1: WebSocket Transmission
+                if (transmissionMode === "websocket" && ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(blob);
                     framesSent++;
-                    
-                    const now = timeSeconds();
-                    if (now - lastTime >= 1.0) {
-                        const mobileFps = framesSent / (now - lastTime);
-                        if (mobileFpsBadge) {
-                            mobileFpsBadge.textContent = `🟢 EN DIRECT (${mobileFps.toFixed(0)} FPS)`;
+                    updateFpsCounter();
+                } 
+                // Mode 2: HTTP POST Fallback (Works on ALL servers/proxies)
+                else {
+                    fetch(`${API_BASE}/api/upload_frame`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/octet-stream" },
+                        body: blob
+                    })
+                    .then(res => {
+                        isSendingFrame = false;
+                        if (res.ok) {
+                            framesSent++;
+                            updateFpsCounter();
+                            if (transmissionMode !== "http") {
+                                transmissionMode = "http";
+                                if (mobileFpsBadge) {
+                                    mobileFpsBadge.textContent = "🟢 EN DIRECT (HTTP)";
+                                    mobileFpsBadge.className = "px-2.5 py-1 bg-blue-900/80 border border-blue-500 text-xs font-mono text-blue-300 font-bold rounded-lg";
+                                }
+                            }
                         }
-                        framesSent = 0;
-                        lastTime = now;
-                    }
-                } else {
-                    isSendingFrame = false;
+                    })
+                    .catch(() => {
+                        isSendingFrame = false;
+                    });
                 }
-            }, "image/jpeg", 0.5); // 50% JPEG quality for smooth, low latency transmission
+            }, "image/jpeg", 0.5); // 50% quality JPEG
         } catch (e) {
             isSendingFrame = false;
         }
         
-    }, 80); // ~12 FPS: optimal stability and zero congestion
+    }, 90); // ~11 FPS
+    
+    function updateFpsCounter() {
+        const now = timeSeconds();
+        if (now - lastTime >= 1.0) {
+            const mobileFps = framesSent / (now - lastTime);
+            if (mobileFpsBadge) {
+                const tag = transmissionMode === "websocket" ? "WS" : "HTTP";
+                mobileFpsBadge.textContent = `🟢 EN DIRECT (${mobileFps.toFixed(0)} FPS - ${tag})`;
+            }
+            framesSent = 0;
+            lastTime = now;
+        }
+    }
 }
 
 function stopMobileCameraStream() {
     isStreamingActive = false;
     isSendingFrame = false;
+    transmissionMode = "websocket";
+    wsFailedCount = 0;
     
     if (streamInterval) {
         clearInterval(streamInterval);

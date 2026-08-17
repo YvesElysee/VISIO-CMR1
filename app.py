@@ -230,6 +230,34 @@ async def websocket_mobile_camera(websocket: WebSocket):
         if client_id in active_mobile_streams:
             del active_mobile_streams[client_id]
 
+# HTTP POST fallback endpoint for mobile camera ingestion
+@app.post("/api/upload_frame")
+async def upload_frame(request: Request):
+    global active_mobile_streams, client_counter
+    try:
+        data = await request.body()
+        if not data:
+            return JSONResponse(content={"status": "empty"}, status_code=400)
+            
+        np_arr = np.frombuffer(data, dtype=np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        
+        if frame is not None:
+            client_ip = request.client.host if request.client else "http_client"
+            client_id = f"http_{client_ip}"
+            
+            resized_frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
+            active_mobile_streams[client_id] = {
+                "frame": resized_frame,
+                "last_update": time.time(),
+                "id": client_ip
+            }
+            settings["video_source"] = "mobile"
+            
+        return JSONResponse(content={"status": "ok"})
+    except Exception as e:
+        return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
+
 # Video streaming loop
 def generate_mjpeg_stream():
     global metrics_state
