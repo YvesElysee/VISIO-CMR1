@@ -58,8 +58,8 @@ metrics_state = {
     "network_loss": 0.5,   # % loss
 }
 
-latest_mobile_frame = None
-mobile_last_update = 0
+active_mobile_streams = {}  # client_id -> {"frame": np_array, "last_update": float, "id": int}
+client_counter = 0
 
 # Video Source Handler
 class VideoSourceManager:
@@ -68,15 +68,13 @@ class VideoSourceManager:
         self.active_source = "simulation"
         
     def get_frame(self):
-        global latest_mobile_frame, mobile_last_update
+        global active_mobile_streams
         self.active_source = settings["video_source"]
         
         if self.active_source == "simulation":
             if self.cap is not None:
                 self.cap.release()
                 self.cap = None
-            # Generate simulation frame
-            # If Denoising is off, generate standard noise. If on, generate high noise so we see the difference
             n_level = 28 if settings["enable_denoise"] else 12
             return generator.generate_frame(noise_level=n_level, blur_strength=3, compression_artifacts=True)
             
@@ -87,7 +85,6 @@ class VideoSourceManager:
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
             ret, frame = self.cap.read()
             if not ret or frame is None:
-                # Show red webcam error frame
                 err_frame = np.zeros((360, 640, 3), dtype=np.uint8)
                 cv2.rectangle(err_frame, (0, 0), (640, 360), (20, 20, 40), -1)
                 cv2.putText(err_frame, "Webcam indisponible ou non connectee", (80, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
@@ -99,22 +96,47 @@ class VideoSourceManager:
             if self.cap is not None:
                 self.cap.release()
                 self.cap = None
-            # Check timeout for mobile camera (5 seconds without updates)
-            if latest_mobile_frame is None or (time.time() - mobile_last_update > 5.0):
+            
+            # Clean up stale connections (> 5 seconds inactive)
+            now = time.time()
+            stale_keys = [k for k, v in active_mobile_streams.items() if (now - v["last_update"]) > 5.0]
+            for k in stale_keys:
+                del active_mobile_streams[k]
+                
+            active_frames = [v["frame"] for v in active_mobile_streams.values() if v["frame"] is not None]
+            
+            if len(active_frames) == 0:
                 err_frame = np.zeros((360, 640, 3), dtype=np.uint8)
-                # Green glassmorphism style card
                 cv2.rectangle(err_frame, (0, 0), (640, 360), (30, 45, 30), -1)
                 cv2.putText(err_frame, "En attente du flux mobile (Android / iOS)", (100, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                cv2.putText(err_frame, "1. Connectez le mobile au MEME reseau Wi-Fi", (60, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1)
-                
-                # Try to get server IP address
-                s_ip = get_local_ip()
-                cv2.putText(err_frame, f"2. Ouvrez : http://{s_ip}:8000", (60, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1)
-                cv2.putText(err_frame, "3. Cliquez sur 'Demarrer Camera Mobile'", (60, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1)
+                cv2.putText(err_frame, "1. Connectez le mobile sur l'adresse web", (60, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1)
+                cv2.putText(err_frame, "2. Cliquez sur 'Demarrer la Camera Mobile'", (60, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1)
                 return err_frame
-            return latest_mobile_frame
-            
-        # Default fallback
+                
+            elif len(active_frames) == 1:
+                return active_frames[0]
+                
+            else:
+                # MULTI-CAMERA SPLIT SCREEN (Multiple phones streaming simultaneously)
+                if len(active_frames) == 2:
+                    f1 = cv2.resize(active_frames[0], (320, 360))
+                    f2 = cv2.resize(active_frames[1], (320, 360))
+                    cv2.putText(f1, "CAM 1 (MOBILE)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    cv2.putText(f2, "CAM 2 (MOBILE)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    combined = np.hstack([f1, f2])
+                    cv2.line(combined, (320, 0), (320, 360), (0, 255, 255), 2)
+                    return combined
+                else:
+                    resized = [cv2.resize(f, (320, 180)) for f in active_frames[:4]]
+                    while len(resized) < 4:
+                        blank = np.zeros((180, 320, 3), dtype=np.uint8)
+                        resized.append(blank)
+                    for idx, img in enumerate(resized):
+                        cv2.putText(img, f"CAM {idx+1}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    top_row = np.hstack([resized[0], resized[1]])
+                    bot_row = np.hstack([resized[2], resized[3]])
+                    return np.vstack([top_row, bot_row])
+                    
         return np.zeros((360, 640, 3), dtype=np.uint8)
 
 manager = VideoSourceManager()
@@ -123,7 +145,6 @@ def get_local_ip():
     """Gets local IP address of the server to display on the placeholder."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Doesn't need to connect, just resolves local routing interface
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
@@ -147,27 +168,22 @@ class SettingsModel(BaseModel):
 
 @app.get("/api/status")
 def get_status():
-    """Returns current settings and performance metrics."""
     global metrics_state
-    
-    # Simulate network packet loss rate depending on codec optimization
-    # In H.265/AV1 mode, bandwidth is reduced, meaning packet loss rate drops under local network constraints.
     if settings["codec_opt"]:
-        metrics_state["network_loss"] = 0.02  # Very stable (0.02% loss)
+        metrics_state["network_loss"] = 0.02
     else:
-        # Without optimization, high bitrate of raw upscaled 1080p H.264 stream causes congestion
-        metrics_state["network_loss"] = 3.84  # 3.84% loss (causes video freeze/glitches)
+        metrics_state["network_loss"] = 3.84
         
     return {
         "settings": settings,
         "metrics": metrics_state,
         "server_ip": get_local_ip(),
-        "has_models": enhancer.has_models
+        "has_models": enhancer.has_models,
+        "active_cameras": len(active_mobile_streams)
     }
 
 @app.post("/api/settings")
 def update_settings(new_settings: SettingsModel):
-    """Updates settings in real-time."""
     global settings
     settings["enable_denoise"] = new_settings.enable_denoise
     settings["denoise_strength"] = new_settings.denoise_strength
@@ -180,35 +196,39 @@ def update_settings(new_settings: SettingsModel):
     settings["selected_model"] = new_settings.selected_model
     settings["video_source"] = new_settings.video_source
     settings["codec_opt"] = new_settings.codec_opt
-    
     return JSONResponse(content={"status": "updated"})
 
 # WebSocket for receiving camera frames from Android/iOS devices
 @app.websocket("/api/ws/mobile")
 async def websocket_mobile_camera(websocket: WebSocket):
     await websocket.accept()
-    global latest_mobile_frame, mobile_last_update
-    settings["video_source"] = "mobile" # Auto-switch backend source to mobile camera
-    print("📱 Smartphone connecté via WebSocket ! Basculement automatique sur la caméra mobile.")
+    global active_mobile_streams, client_counter
+    client_counter += 1
+    client_id = f"client_{client_counter}"
+    active_mobile_streams[client_id] = {"frame": None, "last_update": time.time(), "id": client_counter}
+    
+    settings["video_source"] = "mobile"
+    print(f"📱 Smartphone #{client_counter} connecté via WebSocket ! Total caméras : {len(active_mobile_streams)}")
+    
     try:
         while True:
-            # Receive binary frame (JPEG) from phone browser
             data = await websocket.receive_bytes()
-            # Decode JPEG to opencv image
             np_arr = np.frombuffer(data, dtype=np.uint8)
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             
             if frame is not None:
-                # Resize mobile frame to standard input width (640x360) for consistency
-                latest_mobile_frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
-                mobile_last_update = time.time()
+                resized_frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
+                active_mobile_streams[client_id]["frame"] = resized_frame
+                active_mobile_streams[client_id]["last_update"] = time.time()
                 
-            # Send brief heartbeat acknowledgment back to mobile to regulate speed
             await websocket.send_text("ACK")
     except WebSocketDisconnect:
-        print("Téléphone déconnecté.")
+        print(f"Smartphone #{client_id} déconnecté.")
     except Exception as e:
         print(f"Erreur WebSocket mobile : {e}")
+    finally:
+        if client_id in active_mobile_streams:
+            del active_mobile_streams[client_id]
 
 # Video streaming loop
 def generate_mjpeg_stream():

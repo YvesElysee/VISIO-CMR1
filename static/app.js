@@ -80,14 +80,16 @@ const progressLoss = document.getElementById("progress-loss");
 const lossWarning = document.getElementById("loss-warning");
 const bandwidthSavingText = document.getElementById("bandwidth-saving-text");
 
-// Mobile panels
+// Mobile elements
 const mobileStartSection = document.getElementById("mobile-start-section");
-const mainGrid = document.querySelector("main > div.grid");
 const btnStartMobile = document.getElementById("btn-start-mobile");
 const btnStopMobile = document.getElementById("btn-stop-mobile");
-const mobileCamPanel = document.getElementById("mobile-cam-panel");
+const btnSwitchCamera = document.getElementById("btn-switch-camera");
 const mobileVideo = document.getElementById("mobile-video");
 const mobileFpsBadge = document.getElementById("mobile-fps-badge");
+const cameraOverlayPlaceholder = document.getElementById("camera-overlay-placeholder");
+
+let currentFacingMode = "environment"; // Default back camera
 
 // Initialize Charts
 let latencyChart = null;
@@ -118,9 +120,18 @@ document.addEventListener("DOMContentLoaded", () => {
     // 4. Set the MJPEG stream source dynamically
     hiddenStreamImg.src = `${API_BASE}/api/stream`;
     
-    // 5. Fetch initial settings and status
-    fetchStatus();
-    setInterval(fetchStatus, 1000); // Poll status every second
+    // Mobile button listeners
+    if (btnStartMobile) btnStartMobile.addEventListener("click", startMobileCameraStream);
+    if (btnStopMobile) btnStopMobile.addEventListener("click", stopMobileCameraStream);
+    if (btnSwitchCamera) {
+        btnSwitchCamera.addEventListener("click", () => {
+            currentFacingMode = currentFacingMode === "environment" ? "user" : "environment";
+            if (mobileVideo.srcObject) {
+                stopMobileCameraStream();
+                startMobileCameraStream();
+            }
+        });
+    }
     
     // 5. Start Canvas Draw Loop
     requestAnimationFrame(drawCanvasLoop);
@@ -526,10 +537,9 @@ function updateChartsData(metrics, isCodecOptActive) {
 // PHONE CAMERA CAPTURE LOGIC (CLIENT SIDE)
 async function startMobileCameraStream() {
     try {
-        // Request mobile camera access
         const constraints = {
             video: {
-                facingMode: "environment", // Request back camera
+                facingMode: currentFacingMode,
                 width: { ideal: 640 },
                 height: { ideal: 360 },
                 frameRate: { ideal: 15 }
@@ -539,11 +549,16 @@ async function startMobileCameraStream() {
         
         const stream = await navigator.mediaDevices.getUserMedia(constraints);
         mobileVideo.srcObject = stream;
-        mobileVideo.play();
+        await mobileVideo.play();
         
-        // Show camera panel
-        mobileCamPanel.classList.remove("hidden");
-        mobileStartSection.classList.add("hidden");
+        // Hide placeholder overlay and toggle action buttons
+        if (cameraOverlayPlaceholder) cameraOverlayPlaceholder.classList.add("hidden");
+        if (btnStartMobile) btnStartMobile.classList.add("hidden");
+        if (btnStopMobile) btnStopMobile.classList.remove("hidden");
+        if (mobileFpsBadge) {
+            mobileFpsBadge.textContent = "🟢 Connexion...";
+            mobileFpsBadge.className = "px-2.5 py-1 bg-green-950/80 border border-green-700 text-xs font-mono text-green-400 rounded-lg animate-pulse";
+        }
         
         // Connect WebSocket matching current page protocol (wss: for HTTPS, ws: for HTTP)
         const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -553,7 +568,11 @@ async function startMobileCameraStream() {
         ws = new WebSocket(wsUrl);
         
         ws.onopen = () => {
-            console.log("WebSocket mobile connecté.");
+            console.log("WebSocket mobile connecté avec succès.");
+            if (mobileFpsBadge) {
+                mobileFpsBadge.textContent = "🟢 EN DIRECT";
+                mobileFpsBadge.className = "px-2.5 py-1 bg-green-900/80 border border-green-500 text-xs font-mono text-green-300 font-bold rounded-lg";
+            }
             startSendingFrames();
         };
         
@@ -621,9 +640,12 @@ function stopMobileCameraStream() {
         mobileVideo.srcObject = null;
     }
     
-    mobileCamPanel.classList.add("hidden");
-    if (isMobileDevice) {
-        mobileStartSection.classList.remove("hidden");
+    if (cameraOverlayPlaceholder) cameraOverlayPlaceholder.classList.remove("hidden");
+    if (btnStartMobile) btnStartMobile.classList.remove("hidden");
+    if (btnStopMobile) btnStopMobile.classList.add("hidden");
+    if (mobileFpsBadge) {
+        mobileFpsBadge.textContent = "⚪ Hors-Ligne";
+        mobileFpsBadge.className = "px-2.5 py-1 bg-slate-900 border border-slate-800 text-xs font-mono text-gray-400 rounded-lg";
     }
 }
 
