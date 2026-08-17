@@ -124,11 +124,23 @@ document.addEventListener("DOMContentLoaded", () => {
     if (btnStartMobile) btnStartMobile.addEventListener("click", startMobileCameraStream);
     if (btnStopMobile) btnStopMobile.addEventListener("click", stopMobileCameraStream);
     if (btnSwitchCamera) {
-        btnSwitchCamera.addEventListener("click", () => {
+        btnSwitchCamera.addEventListener("click", async () => {
             currentFacingMode = currentFacingMode === "environment" ? "user" : "environment";
-            if (mobileVideo.srcObject) {
-                stopMobileCameraStream();
-                startMobileCameraStream();
+            if (isStreamingActive && mobileVideo && mobileVideo.srcObject) {
+                // Stop current video tracks only without dropping WebSocket
+                const stream = mobileVideo.srcObject;
+                stream.getTracks().forEach(track => track.stop());
+                try {
+                    const constraints = {
+                        video: { facingMode: currentFacingMode, width: { ideal: 640 }, height: { ideal: 360 } },
+                        audio: false
+                    };
+                    const newStream = await navigator.mediaDevices.getUserMedia(constraints);
+                    mobileVideo.srcObject = newStream;
+                    await mobileVideo.play();
+                } catch (e) {
+                    console.error("Erreur lors du changement de caméra :", e);
+                }
             }
         });
     }
@@ -535,7 +547,11 @@ function updateChartsData(metrics, isCodecOptActive) {
 }
 
 // PHONE CAMERA CAPTURE LOGIC (CLIENT SIDE)
+let isStreamingActive = false;
+let isSendingFrame = false;
+
 async function startMobileCameraStream() {
+    if (isStreamingActive) return;
     try {
         const constraints = {
             video: {
@@ -551,39 +567,16 @@ async function startMobileCameraStream() {
         mobileVideo.srcObject = stream;
         await mobileVideo.play();
         
+        isStreamingActive = true;
+        
         // Hide placeholder overlay and toggle action buttons
         if (cameraOverlayPlaceholder) cameraOverlayPlaceholder.classList.add("hidden");
         if (btnStartMobile) btnStartMobile.classList.add("hidden");
         if (btnStopMobile) btnStopMobile.classList.remove("hidden");
-        if (mobileFpsBadge) {
-            mobileFpsBadge.textContent = "🟢 Connexion...";
-            mobileFpsBadge.className = "px-2.5 py-1 bg-green-950/80 border border-green-700 text-xs font-mono text-green-400 rounded-lg animate-pulse";
-        }
         
-        // Connect WebSocket matching current page protocol (wss: for HTTPS, ws: for HTTP)
-        const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const wsHost = window.location.host;
-        const wsUrl = `${wsProtocol}//${wsHost}/api/ws/mobile`;
-        console.log(`Connexion WebSocket mobile vers : ${wsUrl}`);
-        ws = new WebSocket(wsUrl);
-        
-        ws.onopen = () => {
-            console.log("WebSocket mobile connecté avec succès.");
-            if (mobileFpsBadge) {
-                mobileFpsBadge.textContent = "🟢 EN DIRECT";
-                mobileFpsBadge.className = "px-2.5 py-1 bg-green-900/80 border border-green-500 text-xs font-mono text-green-300 font-bold rounded-lg";
-            }
-            startSendingFrames();
-        };
-        
-        ws.onclose = () => {
-            console.log("WebSocket mobile déconnecté.");
-            stopMobileCameraStream();
-        };
-        
-        ws.onerror = (err) => {
-            console.error("Erreur WebSocket :", err);
-        };
+        // Connect WebSocket and start sending loop
+        connectWebSocket();
+        startSendingFrames();
         
     } catch (e) {
         alert("Impossible d'accéder à la caméra du téléphone : " + e.message);
@@ -591,7 +584,58 @@ async function startMobileCameraStream() {
     }
 }
 
+function connectWebSocket() {
+    if (!isStreamingActive) return;
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    
+    const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const wsHost = window.location.host;
+    const wsUrl = `${wsProtocol}//${wsHost}/api/ws/mobile`;
+    
+    if (mobileFpsBadge) {
+        mobileFpsBadge.textContent = "🟡 Connexion...";
+        mobileFpsBadge.className = "px-2.5 py-1 bg-yellow-950/80 border border-yellow-700 text-xs font-mono text-yellow-400 rounded-lg animate-pulse";
+    }
+    
+    console.log(`Connexion WebSocket mobile vers : ${wsUrl}`);
+    ws = new WebSocket(wsUrl);
+    
+    ws.onopen = () => {
+        console.log("WebSocket mobile connecté avec succès.");
+        isSendingFrame = false;
+        if (mobileFpsBadge) {
+            mobileFpsBadge.textContent = "🟢 EN DIRECT";
+            mobileFpsBadge.className = "px-2.5 py-1 bg-green-900/80 border border-green-500 text-xs font-mono text-green-300 font-bold rounded-lg";
+        }
+    };
+    
+    ws.onmessage = (event) => {
+        // Backend sent ACK: ready for next frame
+        isSendingFrame = false;
+    };
+    
+    ws.onclose = () => {
+        console.log("WebSocket mobile déconnecté. Tentative de reconnexion...");
+        isSendingFrame = false;
+        if (mobileFpsBadge && isStreamingActive) {
+            mobileFpsBadge.textContent = "🟡 Reconnexion...";
+            mobileFpsBadge.className = "px-2.5 py-1 bg-yellow-950/80 border border-yellow-700 text-xs font-mono text-yellow-400 rounded-lg animate-pulse";
+        }
+        // Auto-reconnect WebSocket if streaming is still active
+        if (isStreamingActive) {
+            setTimeout(connectWebSocket, 1500);
+        }
+    };
+    
+    ws.onerror = (err) => {
+        console.error("Erreur WebSocket :", err);
+        try { ws.close(); } catch(e) {}
+    };
+}
+
 function startSendingFrames() {
+    if (streamInterval) clearInterval(streamInterval);
+    
     const hiddenCanvas = document.createElement("canvas");
     hiddenCanvas.width = 640;
     hiddenCanvas.height = 360;
@@ -601,40 +645,58 @@ function startSendingFrames() {
     let lastTime = timeSeconds();
     
     streamInterval = setInterval(() => {
+        if (!isStreamingActive) return;
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        if (isSendingFrame) return; // Flow control: wait for previous frame ACK
+        if (!mobileVideo || mobileVideo.readyState < 2) return;
         
-        // Draw video frame to canvas
-        hCtx.drawImage(mobileVideo, 0, 0, 640, 360);
-        
-        // Convert to blob and send
-        hiddenCanvas.toBlob((blob) => {
-            if (blob && ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(blob);
-                framesSent++;
-                
-                // Update FPS metric on screen
-                const now = timeSeconds();
-                if (now - lastTime >= 1.0) {
-                    const mobileFps = framesSent / (now - lastTime);
-                    mobileFpsBadge.textContent = `${mobileFps.toFixed(1)} FPS`;
-                    framesSent = 0;
-                    lastTime = now;
+        try {
+            hCtx.drawImage(mobileVideo, 0, 0, 640, 360);
+            isSendingFrame = true;
+            
+            hiddenCanvas.toBlob((blob) => {
+                if (blob && ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(blob);
+                    framesSent++;
+                    
+                    const now = timeSeconds();
+                    if (now - lastTime >= 1.0) {
+                        const mobileFps = framesSent / (now - lastTime);
+                        if (mobileFpsBadge) {
+                            mobileFpsBadge.textContent = `🟢 EN DIRECT (${mobileFps.toFixed(0)} FPS)`;
+                        }
+                        framesSent = 0;
+                        lastTime = now;
+                    }
+                } else {
+                    isSendingFrame = false;
                 }
-            }
-        }, "image/jpeg", 0.6); // 60% compression quality
+            }, "image/jpeg", 0.5); // 50% JPEG quality for smooth, low latency transmission
+        } catch (e) {
+            isSendingFrame = false;
+        }
         
-    }, 70); // ~14 frames per second
+    }, 80); // ~12 FPS: optimal stability and zero congestion
 }
 
 function stopMobileCameraStream() {
-    clearInterval(streamInterval);
-    if (ws) {
-        ws.close();
-        ws = null;
+    isStreamingActive = false;
+    isSendingFrame = false;
+    
+    if (streamInterval) {
+        clearInterval(streamInterval);
+        streamInterval = null;
     }
     
-    const stream = mobileVideo.srcObject;
-    if (stream) {
+    if (ws) {
+        const tempWs = ws;
+        ws = null;
+        tempWs.onclose = null; // Prevent triggering auto-reconnect on manual stop
+        try { tempWs.close(); } catch(e) {}
+    }
+    
+    if (mobileVideo && mobileVideo.srcObject) {
+        const stream = mobileVideo.srcObject;
         const tracks = stream.getTracks();
         tracks.forEach(track => track.stop());
         mobileVideo.srcObject = null;
